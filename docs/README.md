@@ -123,6 +123,9 @@ print(b.get())                      # [温度℃, 气压Pa]
 | [neopixel.md](neopixel.md) | Neopixel 16×16 模块 |
 | [keyboard.md](keyboard.md) | 机械按键（KEYBOARD）模块 |
 | [api-reference.md](api-reference.md) | **全部驱动类/方法/常量签名速查表** |
+| [registers.md](registers.md) | **各芯片寄存器映射**（地址、初始化值、数据含义） |
+| [protocols.md](protocols.md) | **通信协议与时序**（I2C/三线/两线/单线、oneshot、中断安全） |
 | [examples.md](examples.md) | 所有 `test.py` / `*_demo.py` 示例索引与运行方式 |
 | [runtime.md](runtime.md) | 运行/部署方式、平台差异与注意事项 |
 | [faq.md](faq.md) | 故障排查与常见问题（FAQ） |
+| [changelog.md](changelog.md) | 版本/日期一览、时间线与已知缺陷 |
