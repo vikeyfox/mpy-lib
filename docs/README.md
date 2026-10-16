@@ -122,4 +122,7 @@ print(b.get())                      # [温度℃, 气压Pa]
 | [misc.md](misc.md) | 外设模块（AT24XX、DS1302/07/3231、irqUART） |
 | [neopixel.md](neopixel.md) | Neopixel 16×16 模块 |
 | [keyboard.md](keyboard.md) | 机械按键（KEYBOARD）模块 |
+| [api-reference.md](api-reference.md) | **全部驱动类/方法/常量签名速查表** |
+| [examples.md](examples.md) | 所有 `test.py` / `*_demo.py` 示例索引与运行方式 |
 | [runtime.md](runtime.md) | 运行/部署方式、平台差异与注意事项 |
+| [faq.md](faq.md) | 故障排查与常见问题（FAQ） |
