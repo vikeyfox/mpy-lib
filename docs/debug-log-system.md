@@ -1,6 +1,6 @@
 # MicroPython 机器人运行时 · 调试采集、解释层与更新系统
 
-> 版本：v1.3  
+> 版本：v1.4  
 > 适用范围：机器人 / 嵌入式设备的调试、行为解释与在线迭代；也适用于老化测试与现场问题复现  
 > 大脑平台：ESP32-C3（基础版）/ ESP32-S3（进阶），运行 MicroPython  
 > 目标平台：ESP32 / ESP32-S3 / ESP8266 / RP2040 / RP2350 / STM32 / SAMD / nRF 等具备 `machine` 模块的 MCU
@@ -1078,6 +1078,7 @@ class OtaTarget:
 ESP32 的具体做法：
 
 - 默认 MicroPython 通用固件通常使用非 OTA 分区表，**固件级 OTA 需要自定义分区表**（`factory` + `ota_0` + `ota_1`，或双 OTA 槽）；
+- **4 MB Flash 上双 app 槽与文件系统难以共存**（两个 1.5 MB 固件槽已占满），C3 基础版建议固件升级走 USB / UART1，固件 OTA 留给 8 MB 模块或 S3；
 - 运行时用 `esp32.Partition` 找到下一更新槽，分块写入，校验后 `set_boot()` 并重启；
 - 若暂时不改分区表，则“固件 OTA”退化为 UART1 / USB 维护模式烧录，**技能包热更新不受影响**；
 - 无论哪种方式，都必须保留 esptool 可恢复的串口与 BOOT 引脚。
@@ -1811,6 +1812,110 @@ jq 'select(.src=="bmp280" and .t>=60000 and .t<120000)' session/events.jsonl
 底盘 bootloader 的升级帧类型与双槽约定，必须在 P0 / P1 就预留，但功能实现可以放到 P5——**协议要提前留位，实现可以延后**。
 
 建议顺序：**先把 P0 / P1 的协议与安全边界打通**，这是不可回退的基础；再做 P2 / P3 的解释与确认；然后 P4 接 AI 慢环；最后 P5 / P6 补 OTA 与多链路。不要一上来就让 AI 生成动作逻辑——没有硬限幅、影子、人工确认和反馈数据，生成的代码既无法验证也无法归因。
+
+### 13.1 P0 的第 0 步：先抓包，再写解析器
+
+底盘协议是固定的，但**文档与固件经常不一致**。在写 `chassis.py` 之前，先用 USB-TTL 或逻辑分析仪录下真实帧：
+
+- 上电后底盘主动发什么、周期多少；
+- 上位机是否需要先发握手帧，底盘才回遥测；
+- 帧头、长度、校验方式、字节序、有无转义；
+- 遥测字段的缩放系数与单位（例如速度是 mm/s 还是 0.1 mm/s）；
+- 断链后底盘是停车、保持，还是进入故障态。
+
+把 20~30 帧存成 `captures/*.bin`，作为解析器的测试向量。**这一步不做，后面所有“协议已打通”的结论都不可信。**
+
+### 13.2 C3 接线与引脚建议
+
+以 ESP32-C3-WROOM-02-N4 / DevKitM-1 为例，避开 strapping 与 Flash 占用引脚：
+
+| 信号 | 建议引脚 | 说明 |
+| --- | --- | --- |
+| 底盘 UART TX | GPIO6 | 接底盘 RX，3.3 V 电平 |
+| 底盘 UART RX | GPIO7 | 接底盘 TX；若底盘为 5 V TTL，加分压或电平转换 |
+| 调试 / 烧录 | USB D-/D+（GPIO18/19） | 原生 USB Serial/JTAG，保留 REPL 与 esptool |
+| 急停输入 | GPIO4 | 上拉输入，低有效；同时接入硬件断电回路 |
+| 状态指示 | GPIO5 | 心跳、故障、OTA 状态 |
+| 电源 | 5V / GND | 与底盘共地，加 TVS 与去耦 |
+| BOOT | GPIO9 | 仅烧录时使用，业务中禁止复用 |
+| 禁用 | GPIO2 / 8 / 9 / 11~17 | strapping、VDD_SPI、片内 Flash |
+
+接线原则：串阻 + TVS、远离电机线、两板共地；长线或强干扰环境改用隔离收发器。**急停必须同时切断驱动使能，不能只进 GPIO。**
+
+### 13.3 4 MB Flash 的分区取舍
+
+| 区域 | 典型大小 | 说明 |
+| --- | --- | --- |
+| bootloader + 分区表 | < 64 KB | 由构建生成，不手改 |
+| app（MicroPython） | 1.4~1.6 MB | 固件本体 |
+| nvs | 16~24 KB | WiFi/BLE 校准与配置 |
+| LittleFS | 剩余约 1.4~2 MB | 日志、技能包、配置；留 10% 余量 |
+
+具体偏移以所用 MicroPython 构建的 `partitions-4MiB.csv` 为准。**4 MB 上不要规划固件 A/B 双槽**：两个 app 槽已占满，没有空间放日志。基础版的策略是“技能 BLE 热更新 + 固件 USB/UART1 维护升级”；需要固件 OTA 时换 8 MB 模块或 S3。
+
+### 13.4 P0 模块清单
+
+| 文件 | 职责 | P0 范围 |
+| --- | --- | --- |
+| `boot.py` | 挂载文件系统、读配置、启动运行时、失败时保留 REPL | 必须 |
+| `main.py` | 入口、看门狗、顶层异常兜底 | 必须 |
+| `board.py` | 引脚映射、UART 初始化、LED、链路模式 | 必须 |
+| `config.json` | 设备 ID、波特率、采样率、日志上限、链路模式 | 必须 |
+| `logcore.py` | record / ring / writer / session / CRC / 恢复 | 必须 |
+| `sink.py` | `FlashSink`（P0）、`NullSink` | 必须 |
+| `chassis.py` | 帧编解码、握手状态机、`seq` 丢帧统计 | 必须 |
+| `runtime.py` | 状态机、采样调度、链路切换 | 必须 |
+| `diag.py` | 启动自检、heap / uptime 周期采样 | 建议 |
+| `tools/logctl.py` | 上位机侧拉取、解析、校验 | 建议 |
+
+协议解析保持可替换，不要把帧格式写进运行时：
+
+```python
+class FrameCodec:
+    """固定协议适配层：P0 只实现 decode，encode 仅 HELLO/HEARTBEAT。"""
+    def feed(self, buf):
+        # 追加到内部缓冲，返回 [(msg_type, payload), ...]
+        ...
+
+    def encode(self, msg_type, payload):
+        ...
+```
+
+注意区分两个序号：日志 `seq` 是本系统自增的，底盘帧里的 `seq` 要原样记到 `m.chassis_seq`。底盘 `seq` 跳变时写一条 `ev=drop, m={"n": 缺失数}`，这是判断 UART 丢帧的唯一可靠依据。
+
+### 13.5 P0 验收用例
+
+| # | 场景 | 通过标准 |
+| --- | --- | --- |
+| 1 | 上电握手 | 3 s 内发出 `HELLO`，收到 `CAPS` 并写入会话快照 |
+| 2 | 遥测连续性 | 20 Hz 连续 10 min，底盘 `seq` 丢帧率 < 0.1% |
+| 3 | 掉电恢复 | 连续拔电 10 次，每次都能恢复到最后一个完整 CRC 记录 |
+| 4 | 会话完整性 | 目录含 `manifest.json` / `events.jsonl` / `index.jsonl`，`close.reason` 正确 |
+| 5 | 容量轮转 | 剩余空间 < 10% 时触发轮转，旧会话按策略淘汰 |
+| 6 | 链路断开 | UART 静默 200 ms 后写 `ev=link`，进程不崩溃、不重启 |
+| 7 | 长稳 | 连续 24 h，`gc.mem_free()` 无持续下降趋势 |
+| 8 | 可解析性 | 上位机解析 `events.jsonl`，除最后截断外 100% 可读 |
+
+### 13.6 P0 启动时序
+
+```mermaid
+sequenceDiagram
+    participant B as boot.py
+    participant R as runtime
+    participant C as chassis
+    participant L as logcore
+    B->>R: 挂载 FS、读 config
+    R->>L: 开 Session（写 manifest 草稿）
+    R->>C: HELLO（500 ms 重试）
+    C-->>R: CAPS
+    R->>L: 写 boot / CAPS 快照
+    R->>C: 订阅 TELEM
+    loop 20~50 Hz
+        C-->>R: TELEM
+        R->>L: emit(sample)
+    end
+    Note over R,L: writer 独立 flush、轮转、恢复
+```
 
 ---
 
