@@ -16,7 +16,13 @@
   },
   "runtime": {
     "loop_ms": 20,
+    "log_mode": "on_change",
     "log_hz": 1,
+    "log_min_ms": 200,
+    "log_max_ms": 60000,
+    "v_delta": 10,
+    "w_delta": 20,
+    "batt_delta": 1,
     "chassis_timeout_ms": 200
   }
 }

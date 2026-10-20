@@ -1,6 +1,6 @@
 # MicroPython 机器人运行时 · 调试采集、解释层与更新系统
 
-> 版本：v1.5  
+> 版本：v1.6  
 > 适用范围：机器人 / 嵌入式设备的调试、行为解释与在线迭代；也适用于老化测试与现场问题复现  
 > 大脑平台：ESP32-C3（基础版）/ ESP32-S3（进阶），运行 MicroPython  
 > 目标平台：ESP32 / ESP32-S3 / ESP8266 / RP2040 / RP2350 / STM32 / SAMD / nRF 等具备 `machine` 模块的 MCU
@@ -388,6 +388,7 @@ flowchart TB
   "device": {"name": "bench-01"},
   "log": {
     "root": "/LOG",
+    "mode": "on_change",
     "flush_ms": 1000,
     "rotate_bytes": 524288,
     "keep_sessions": 8,
@@ -1928,10 +1929,10 @@ P0 的最小实现已落在 `robot-runtime/`，与上面的模块清单一一对
 
 | 文件 | 作用 |
 | --- | --- |
-| `logcore.py` | 会话、JSONL 追加、索引、轮转、掉电截断恢复 |
+| `logcore.py` | 会话、JSONL 追加、索引、轮转、掉电截断恢复、`LOG.md` 摘要 |
 | `sink.py` | `FileSink` / `NullSink`，P1 再扩 SD 与网络 |
 | `chassis.py` | `FrameCodec` 接口、`MockCodec`、握手与 `seq` 丢帧统计 |
-| `runtime.py` | 状态机、1 Hz 降采样、链路超时 |
+| `runtime.py` | 状态机、周期 / 变化触发两种日志模式、链路超时 |
 | `board.py` | C3 引脚与 UART 初始化 |
 | `boot.py` / `main.py` | 启动与异常兜底 |
 | `config.json` | 设备、串口、日志、运行时参数 |
@@ -1946,7 +1947,9 @@ python3 tests/test_p0.py
 python3 tools/logctl.py verify /tmp/p0demo/SDEMO
 ```
 
-当前测试覆盖：掉电截断恢复、轮转与索引、逐字节粘包/拆包、底盘 `seq` 丢帧、运行时写 `sample`、200 ms 链路超时。
+当前测试覆盖：掉电截断恢复、轮转与索引、逐字节粘包/拆包、底盘 `seq` 丢帧、运行时写 `sample`、变化触发降频、`LOG.md` 与 manifest 统计、200 ms 链路超时。
+
+默认 `config.json` 使用 `log_mode: on_change`：静止时按 `max_interval_ms`（默认 60 s）写一条心跳，运动时只在 `v/w/batt` 超过阈值时记录。把它改成 `periodic` 就回到固定 `log_hz`。这是 4 MB Flash 下把“几小时”拉长到“一两天”的关键手段。
 
 上机时把 `.py` 与 `config.json` 复制到设备根目录即可，`main.py` 会自动执行。**`MockCodec` 只是占位**：拿到 13.1 的抓包后，实现对应的 `FrameCodec` 并替换 `main.py` 里的一行，`runtime` 不需要改动。
 

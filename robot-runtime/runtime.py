@@ -11,10 +11,18 @@ class Runtime:
         self.loop_ms = cfg.get("loop_ms", 20)
         self.log_hz = cfg.get("log_hz", 1)
         self.device_id = cfg.get("device_id", "unknown")
+        self.log_mode = cfg.get("log_mode", "periodic")
+        self.log_min_ms = cfg.get("log_min_ms", 200)
+        self.log_max_ms = cfg.get("log_max_ms", 60000)
+        self.v_delta = cfg.get("v_delta", 10)
+        self.w_delta = cfg.get("w_delta", 20)
+        self.batt_delta = cfg.get("batt_delta", 1)
 
         self.state = "BOOT"
         self.started = now_ms()
         self.next_log = 0
+        self.last_logged = None
+        self.last_log_t = 0
         self.link_lost = False
         self.handshake_logged = False
 
@@ -51,12 +59,33 @@ class Runtime:
 
         if self.state == "READY" and self.link.last_telem is not None:
             t = now_ms()
-            if t >= self.next_log:
-                period = int(1000 / self.log_hz) if self.log_hz else 1000
-                self.next_log = t + period
+            if self._due(t, self.link.last_telem):
+                self.last_log_t = t
+                self.last_logged = dict(self.link.last_telem)
                 self.log.emit("chassis", "INFO", "sample", self.link.last_telem)
 
         self.log.sync()
+
+    def _due(self, t, telem):
+        if self.log_mode != "on_change":
+            if t >= self.next_log:
+                period = int(1000 / self.log_hz) if self.log_hz else 1000
+                self.next_log = t + period
+                return True
+            return False
+
+        if self.last_logged is None:
+            return True
+        elapsed = t - self.last_log_t
+        if elapsed < self.log_min_ms:
+            return False
+        if elapsed >= self.log_max_ms:
+            return True
+        return (
+            abs(telem["v"] - self.last_logged["v"]) >= self.v_delta
+            or abs(telem["w"] - self.last_logged["w"]) >= self.w_delta
+            or abs(telem["batt"] - self.last_logged["batt"]) >= self.batt_delta
+        )
 
     def run(self):
         while True:

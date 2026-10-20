@@ -63,6 +63,16 @@ def _dumps(obj):
     return json.dumps(obj)
 
 
+def _fmt_ts(ts):
+    if ts is None:
+        return "-"
+    try:
+        t = time.localtime(ts)
+        return "%04d-%02d-%02d %02d:%02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5])
+    except Exception:
+        return str(ts)
+
+
 class Session:
     """一个会话目录：/LOG/<sid>/{manifest.json,events.jsonl,index.jsonl}。"""
 
@@ -82,8 +92,18 @@ class Session:
         self.recovered = 0
         self.dropped = 0
         self.last_flush = now_ms()
+        self.last_fs_sync = self.last_flush
         self.events = None
         self.index = None
+        self.device = (meta or {}).get("device", {}).get("id")
+        self.stats = {
+            "total": 0,
+            "levels": {},
+            "first_t": None,
+            "last_t": None,
+            "chassis_drop": 0,
+            "errors": [],
+        }
 
         ensure_dir(root)
         ensure_dir(self.dir)
@@ -174,6 +194,20 @@ class Session:
         line = (_dumps(rec) + "\n").encode()
         self.events.write(line)
         self.offset += len(line)
+
+        st = self.stats
+        st["total"] += 1
+        st["levels"][lvl] = st["levels"].get(lvl, 0) + 1
+        if st["first_t"] is None:
+            st["first_t"] = rec["t"]
+        st["last_t"] = rec["t"]
+        if ev == "drop" and m:
+            st["chassis_drop"] += int(m.get("n", 0))
+        if lvl in ("ERROR", "CRIT"):
+            st["errors"].append({"t": rec["t"], "src": src, "ev": ev, "m": m})
+            if len(st["errors"]) > 5:
+                st["errors"].pop(0)
+
         if self.seq % self.index_every == 0:
             self._index(rec)
         if self.offset >= self.rotate_bytes:
@@ -195,7 +229,10 @@ class Session:
             return
         self.events.sync()
         self.index.sync()
-        fs_sync()
+        # os.sync 会提交整个文件系统，代价明显，低频执行即可
+        if force or (now_ms() - self.last_fs_sync) >= 5000:
+            fs_sync()
+            self.last_fs_sync = now_ms()
         self.last_flush = now_ms()
 
     def rotate(self):
@@ -227,10 +264,46 @@ class Session:
         self.sync(force=True)
         self.events.close()
         self.index.close()
+        self._write_summary(reason)
         self._write_manifest(
             {"close": {"reason": reason, "ts": epoch_s(), "t": now_ms()}},
             running=False,
         )
+
+    def _write_summary(self, reason):
+        st = self.stats
+        first = st["first_t"]
+        last = st["last_t"]
+        duration = 0 if first is None else (last - first) / 1000.0
+        levels = ", ".join("%s=%d" % (k, st["levels"][k]) for k in LEVELS if k in st["levels"])
+
+        lines = [
+            "# %s" % self.sid,
+            "",
+            "- 设备: %s" % (self.device or "-"),
+            "- 状态: closed",
+            "- 结束原因: %s" % reason,
+            "- 记录数: %d（本次运行）" % st["total"],
+            "- 级别: %s" % (levels or "-"),
+            "- 时长: %.1f s" % duration,
+            "- 底盘丢帧: %d" % st["chassis_drop"],
+            "",
+            "## 最近错误",
+            "",
+        ]
+        if st["errors"]:
+            for item in st["errors"]:
+                lines.append("- t=%s src=%s ev=%s m=%s" % (
+                    item["t"], item["src"], item["ev"], _dumps(item["m"])))
+        else:
+            lines.append("无")
+        lines.append("")
+
+        try:
+            with open(self._path("LOG.md"), "w") as f:
+                f.write("\n".join(lines))
+        except OSError:
+            pass
 
     def _write_manifest(self, meta, running):
         path = self._path("manifest.json")
@@ -251,6 +324,15 @@ class Session:
             "max_files": self.max_files,
             "index_every": self.index_every,
         }
+        doc["stats"] = {
+            "records": self.stats["total"],
+            "levels": self.stats["levels"],
+            "duration_ms": 0 if self.stats["first_t"] is None
+            else self.stats["last_t"] - self.stats["first_t"],
+            "chassis_drop": self.stats["chassis_drop"],
+        }
+        if not running:
+            doc["files"]["summary"] = "LOG.md"
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
             f.write(_dumps(doc))

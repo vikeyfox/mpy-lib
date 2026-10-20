@@ -139,6 +139,54 @@ class P0Tests(unittest.TestCase):
         now[0] = 1300
         self.assertTrue(link.timed_out())
 
+    def test_on_change_logging(self):
+        cfg = {"rotate_bytes": 10 ** 9, "index_every": 10, "flush_ms": 0}
+        s = Session(self.root, "S4", {}, cfg)
+        codec = MockCodec()
+        uart = FakeUart()
+        uart.rx = codec.encode(MSG_CAPS, b"{}") + codec.encode(MSG_TELEM, telem(1, v=100))
+        link = ChassisLink(uart, codec, clock=lambda: 1000)
+        rt = Runtime(link, s, {
+            "log_mode": "on_change",
+            "log_min_ms": 0,
+            "log_max_ms": 60000,
+            "v_delta": 10,
+            "w_delta": 20,
+            "batt_delta": 1,
+            "device_id": "t",
+        })
+        rt.tick()
+        uart.rx = codec.encode(MSG_TELEM, telem(2, v=101))
+        rt.tick()
+        uart.rx = codec.encode(MSG_TELEM, telem(3, v=150))
+        rt.tick()
+        s.close("user")
+
+        with open(os.path.join(self.root, "S4", "events.jsonl")) as f:
+            records = [json.loads(line) for line in f if line.strip()]
+        samples = [r for r in records if r["ev"] == "sample"]
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(samples[-1]["m"]["v"], 150)
+
+    def test_summary_and_stats(self):
+        cfg = {"rotate_bytes": 10 ** 9, "index_every": 10, "flush_ms": 0}
+        s = Session(self.root, "S5", {"device": {"id": "bot"}}, cfg)
+        s.emit("sys", "ERROR", "fault", {"code": 7})
+        s.emit("chassis", "WARN", "drop", {"n": 3})
+        s.close("power_loss")
+
+        with open(os.path.join(self.root, "S5", "LOG.md")) as f:
+            md = f.read()
+        self.assertIn("结束原因: power_loss", md)
+        self.assertIn("底盘丢帧: 3", md)
+        self.assertIn("code", md)
+
+        with open(os.path.join(self.root, "S5", "manifest.json")) as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["stats"]["records"], 3)
+        self.assertEqual(manifest["stats"]["chassis_drop"], 3)
+        self.assertEqual(manifest["files"]["summary"], "LOG.md")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
