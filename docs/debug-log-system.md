@@ -1,6 +1,6 @@
 # MicroPython 机器人运行时 · 调试采集、解释层与更新系统
 
-> 版本：v1.4  
+> 版本：v1.5  
 > 适用范围：机器人 / 嵌入式设备的调试、行为解释与在线迭代；也适用于老化测试与现场问题复现  
 > 大脑平台：ESP32-C3（基础版）/ ESP32-S3（进阶），运行 MicroPython  
 > 目标平台：ESP32 / ESP32-S3 / ESP8266 / RP2040 / RP2350 / STM32 / SAMD / nRF 等具备 `machine` 模块的 MCU
@@ -1853,6 +1853,11 @@ jq 'select(.src=="bmp280" and .t>=60000 and .t<120000)' session/events.jsonl
 
 具体偏移以所用 MicroPython 构建的 `partitions-4MiB.csv` 为准。**4 MB 上不要规划固件 A/B 双槽**：两个 app 槽已占满，没有空间放日志。基础版的策略是“技能 BLE 热更新 + 固件 USB/UART1 维护升级”；需要固件 OTA 时换 8 MB 模块或 S3。
 
+容量还要算一笔账：1 Hz、单条约 150 B，一天约 13 MB。**4 MB 内置 Flash 只能保留几小时**，不是“够不够写”的问题，而是“能回溯多久”的问题。基础版有两条路：
+
+- 降频或聚合：只在数值变化超过阈值时落 `sample`，其余写 1 分钟一条的摘要；
+- 加 SD 卡（P1）：长时间无人值守必须上 SD，内置 Flash 只做最近窗口与掉电兜底。
+
 ### 13.4 P0 模块清单
 
 | 文件 | 职责 | P0 范围 |
@@ -1889,7 +1894,7 @@ class FrameCodec:
 | --- | --- | --- |
 | 1 | 上电握手 | 3 s 内发出 `HELLO`，收到 `CAPS` 并写入会话快照 |
 | 2 | 遥测连续性 | 20 Hz 连续 10 min，底盘 `seq` 丢帧率 < 0.1% |
-| 3 | 掉电恢复 | 连续拔电 10 次，每次都能恢复到最后一个完整 CRC 记录 |
+| 3 | 掉电恢复 | 连续拔电 10 次，每次都能恢复到最后一个完整记录 |
 | 4 | 会话完整性 | 目录含 `manifest.json` / `events.jsonl` / `index.jsonl`，`close.reason` 正确 |
 | 5 | 容量轮转 | 剩余空间 < 10% 时触发轮转，旧会话按策略淘汰 |
 | 6 | 链路断开 | UART 静默 200 ms 后写 `ev=link`，进程不崩溃、不重启 |
@@ -1915,6 +1920,39 @@ sequenceDiagram
         R->>L: emit(sample)
     end
     Note over R,L: writer 独立 flush、轮转、恢复
+```
+
+### 13.7 可运行骨架
+
+P0 的最小实现已落在 `robot-runtime/`，与上面的模块清单一一对应：
+
+| 文件 | 作用 |
+| --- | --- |
+| `logcore.py` | 会话、JSONL 追加、索引、轮转、掉电截断恢复 |
+| `sink.py` | `FileSink` / `NullSink`，P1 再扩 SD 与网络 |
+| `chassis.py` | `FrameCodec` 接口、`MockCodec`、握手与 `seq` 丢帧统计 |
+| `runtime.py` | 状态机、1 Hz 降采样、链路超时 |
+| `board.py` | C3 引脚与 UART 初始化 |
+| `boot.py` / `main.py` | 启动与异常兜底 |
+| `config.json` | 设备、串口、日志、运行时参数 |
+| `tools/logctl.py` | 上位机侧 `verify` / `summary` / `tail` |
+| `tests/test_p0.py` | 主机侧回归测试 |
+
+主机侧自测：
+
+```sh
+cd robot-runtime
+python3 tests/test_p0.py
+python3 tools/logctl.py verify /tmp/p0demo/SDEMO
+```
+
+当前测试覆盖：掉电截断恢复、轮转与索引、逐字节粘包/拆包、底盘 `seq` 丢帧、运行时写 `sample`、200 ms 链路超时。
+
+上机时把 `.py` 与 `config.json` 复制到设备根目录即可，`main.py` 会自动执行。**`MockCodec` 只是占位**：拿到 13.1 的抓包后，实现对应的 `FrameCodec` 并替换 `main.py` 里的一行，`runtime` 不需要改动。
+
+```python
+# main.py
+link = ChassisLink(uart, RealCodec(), timeout_ms=200)
 ```
 
 ---

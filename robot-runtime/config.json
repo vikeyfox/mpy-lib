@@ -1,0 +1,22 @@
+{
+  "device_id": "bot-c3-01",
+  "uart": {
+    "id": 1,
+    "baud": 115200,
+    "tx": 6,
+    "rx": 7
+  },
+  "led": 5,
+  "log": {
+    "root": "/LOG",
+    "flush_ms": 1000,
+    "rotate_bytes": 262144,
+    "max_files": 4,
+    "index_every": 100
+  },
+  "runtime": {
+    "loop_ms": 20,
+    "log_hz": 1,
+    "chassis_timeout_ms": 200
+  }
+}
