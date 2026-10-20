@@ -1,6 +1,6 @@
-# MicroPython 调试日志采集系统 · 设计方案
+# MicroPython 机器人运行时 · 调试采集、解释层与技能热更新
 
-> 版本：v1.1  
+> 版本：v1.2  
 > 适用范围：机器人 / 嵌入式设备的调试、行为解释与在线迭代；也适用于老化测试与现场问题复现  
 > 目标平台：ESP32 / ESP32-S3 / ESP8266 / RP2040 / RP2350 / STM32 / SAMD / nRF 等具备 `machine` 模块的 MCU
 
@@ -111,6 +111,8 @@ flowchart TB
 - **更新层**：管理 `app_a` / `app_b` 两个应用槽位，与日志系统解耦。更新只替换 `app/`，`kernel/` 保持稳定，正在写入的会话不受影响。
 
 换一种说法：采集层负责“感知”，解释层负责“说出理由”，更新层负责“换一套行为”。三者共用同一套记录格式，因此智能体看到的永远是同一种文档。
+
+在整机层面，这三条能力对应**底盘契约、运行时契约、技能契约**的划分，以及“设备快环 + 上位机慢环”的双环结构，详见第 9 章。
 
 ---
 
@@ -1029,9 +1031,314 @@ logctl logs --tail 50 --host 192.168.4.1
 
 ---
 
-## 9. 可靠性设计
+## 9. 整机工程：固定底盘 + 可更新技能层
 
-### 9.1 掉电恢复
+### 9.1 三个契约
+
+整机只允许通过三个稳定契约交互，任何一层都不越界：
+
+| 契约 | 归属 | 变更频率 | 内容 |
+| --- | --- | --- | --- |
+| **底盘契约** | 底盘固件 | 极低（版本化） | 帧协议、命令、遥测、能力描述、硬安全 |
+| **运行时契约** | `kernel/` | 低 | `ctx` API、生命周期、调度、日志、更新 |
+| **技能契约** | `app_a/` / `app_b/` | 高（AI 生成） | `skill.json` + 行为代码 + 参数 |
+
+核心原则：
+
+- 上位机与 AI **只写技能层**，永远不生成或修改底盘固件；
+- 底盘只暴露“能力”，不暴露寄存器、PID 参数或电机对象；
+- 运行时是唯一同时看见两侧的组件，负责翻译、限幅、记录与回滚。
+
+### 9.2 三种拓扑
+
+| 拓扑 | 结构 | 优点 | 缺点 | 适用 |
+| --- | --- | --- | --- | --- |
+| A 单芯 | 底盘控制与 MicroPython 同核 | 成本最低 | 应用崩溃会拖垮控制，安全隔离弱 | 玩具、教学 |
+| B 双芯（推荐） | 底盘 MCU + 大脑 MCU，UART/CAN | 安全隔离、可独立升级、实时性好 | 多一颗 MCU 与一条线束 | 大多数机器人 |
+| C 上位机直连 | PC 跑技能，底盘挂 USB/串口 | 算力最强、调试方便 | 不能脱机，线缆受限 | 台架与研究 |
+
+双芯拓扑下：
+
+- 底盘 MCU 负责电机闭环、传感器采集、限幅、急停，固件固定；
+- 大脑 MCU 跑 MicroPython，负责技能逻辑、日志、解释与更新；
+- 两者之间只有一条协议链路，协议版本写在 `HELLO` 帧里。
+
+### 9.3 底盘协议（固定）
+
+#### 帧格式
+
+```text
+0xAA 0x55 | ver(1) | type(1) | flags(1) | seq(2,LE) | len(2,LE) | payload | crc16(2,LE)
+```
+
+- `crc16` 使用 CCITT 多项式，覆盖 `ver` 到 `payload`；
+- 单帧 payload ≤ 256 字节，长内容分片；
+- 大脑侧接收使用状态机解析，禁止一次性 `read()` 后假设整帧到达；
+- 命令最高 50 Hz，遥测默认 20 Hz，心跳 200 ms 一次。
+
+#### 消息类型
+
+| 类型 | 方向 | 用途 |
+| --- | --- | --- |
+| `HELLO` | 双向 | 协议版本、设备 ID、能力摘要 |
+| `CAPS` | 底盘 → 大脑 | 完整能力描述（JSON 或 TLV） |
+| `ARM` | 大脑 → 底盘 | 进入可运动状态 |
+| `DISARM` | 双向 | 退出可运动状态 |
+| `SET_VEL` | 大脑 → 底盘 | 线速度 `v`、角速度 `w` |
+| `SET_ACT` | 大脑 → 底盘 | 执行器 ID 与目标值 |
+| `STOP` | 双向 | 按限加速度减速停车 |
+| `ESTOP` | 双向 / 硬件 | 立即断使能刹车，锁存故障 |
+| `CLEAR_FAULT` | 大脑 → 底盘 | 静止且无危险时清故障 |
+| `HEARTBEAT` | 大脑 → 底盘 | 超时 200 ms 自动停车 |
+| `TELEM` | 底盘 → 大脑 | 位姿、电量、传感器快照、执行器反馈 |
+| `FAULT` | 底盘 → 大脑 | 故障码与发生时刻 |
+
+#### 能力描述
+
+```json
+{
+  "proto": "1.0",
+  "model": "diff-01",
+  "capabilities": [
+    {"id": "drive.diff", "cmd": "SET_VEL",
+     "limits": {"v_max": 0.6, "w_max": 1.8, "a_max": 0.8}},
+    {"id": "sensor.tof", "fields": {"left": "m", "right": "m"}, "rate_hz": 20},
+    {"id": "sensor.imu", "fields": {"yaw": "rad", "pitch": "rad"}},
+    {"id": "actuator.gripper", "range": [0, 1], "max_force_n": 20}
+  ]
+}
+```
+
+能力描述是**技能合法性的唯一依据**：技能声明的 `requires` 必须全部出现在这份清单里，否则拒绝部署。
+
+#### 底盘强制安全
+
+以下保护必须在底盘固件内实现，**不允许由技能层覆盖**：
+
+- 速度、角速度、加速度硬限幅；
+- 指令超时（200 ms 无心跳或新指令）自动停车；
+- 硬件急停回路直接切断电机使能；
+- 过流、过温、倾角超限保护；
+- 故障锁存，必须显式 `CLEAR_FAULT` 才能恢复；
+- `ARM` 之前拒绝任何运动指令。
+
+技能层可以“请求更快”，但底盘只按自己的上限执行，并在遥测中回报实际值。这样 AI 生成的代码即使有错，也不会突破物理安全边界。
+
+### 9.4 运行时契约
+
+技能只允许通过 `ctx` 访问外部世界：
+
+```python
+def setup(ctx):
+    ctx.chassis.require("drive.diff", "sensor.tof")
+    ctx.state = {"phase": "idle"}
+
+def step(ctx):
+    tof = ctx.chassis.read("tof.left")
+    if tof < ctx.params["stop_distance"]:
+        ctx.log.outcome("avoid", ok=False, observed={"tof": tof})
+        ctx.chassis.stop()
+        return
+    ctx.chassis.set_velocity(ctx.params["speed"], 0.0)
+
+def on_event(ctx, e):
+    if e["type"] == "fault":
+        ctx.chassis.stop()
+
+def teardown(ctx):
+    ctx.chassis.stop()
+```
+
+| `ctx` 成员 | 作用 | 约束 |
+| --- | --- | --- |
+| `ctx.chassis` | 读能力、读遥测、发运动/执行器命令 | 只能调用 `requires` 中声明过的能力 |
+| `ctx.log` | `intent / plan / action / outcome / mark` | 自动补 `cid`、`seq`、`t` |
+| `ctx.params` | 校验后的技能参数 | 只读，范围由 `skill.json` 约束 |
+| `ctx.now_ms()` | 单调时钟 | 禁止直接读硬件计时器 |
+| `ctx.deadline_ms(n)` | 声明本步预算 | 超时由监督器记录并跳过下发 |
+
+监督器在每次 `step` 前后执行：
+
+1. 能力 ACL 检查；
+2. 命令频率与幅度检查（超限则夹紧并写 `WARN`）；
+3. 单步耗时预算（默认 20 ms，超时写 `assert`）；
+4. 心跳续期；
+5. 急停与故障状态检查，命中则跳过 `step`。
+
+### 9.5 技能包
+
+```text
+pkg-patrol-0.3.1/
+├── skill.json
+└── app/
+    ├── main.py
+    ├── behaviors/
+    │   └── follow_wall.py
+    └── params.json
+```
+
+```json
+{
+  "id": "patrol",
+  "version": "0.3.1",
+  "entry": "app.main",
+  "mode": "shadow",
+  "requires": ["drive.diff", "sensor.tof", "sensor.imu"],
+  "params": {
+    "speed": {"type": "float", "min": 0.1, "max": 0.5, "default": 0.3},
+    "stop_distance": {"type": "float", "min": 0.15, "max": 0.5, "default": 0.25}
+  },
+  "safety": {
+    "max_speed": 0.5,
+    "stop_on": ["tof.left < 0.2", "battery < 20"],
+    "max_runtime_s": 600
+  },
+  "metrics": ["goal_reached", "abort_count", "collision_count", "time_s"]
+}
+```
+
+技能包校验流水线（顺序执行，任一失败即拒绝）：
+
+| 步骤 | 检查 | 失败后果 |
+| --- | --- | --- |
+| 1 | `skill.json` schema 与参数范围 | 拒绝 |
+| 2 | `requires` ⊆ 底盘能力表 | 拒绝 |
+| 3 | 导入白名单与 AST 静态检查（禁止 `machine` 直连、`eval`、动态导入） | 拒绝 |
+| 4 | 设备端 `compile()` 语法检查 | 拒绝 |
+| 5 | **shadow 模式**：只记录“本应下发的命令”，不真正驱动 | 转人工或延长观察 |
+| 6 | live 上线，指标回流 | 异常自动回滚 |
+
+第 5 步是 AI 生成代码能否直接上机的关键：影子模式让新技能在真实传感器输入下完整跑一遍决策，只把执行动作写进日志，再由上位机对比“意图 vs 实际”，确认无危险后才允许 `mode: live`。
+
+### 9.6 双环运行逻辑
+
+整机由两个时间尺度的闭环组成：
+
+```mermaid
+flowchart LR
+    subgraph FAST["快环 · 设备 20~50 Hz"]
+        S1["读取遥测"] --> S2["技能决策"]
+        S2 --> S3["监督器校验"]
+        S3 --> S4["底盘执行"]
+        S4 --> S5["记录 intent/action/outcome"]
+    end
+
+    subgraph SLOW["慢环 · 上位机 AI"]
+        H1["读 EXPLAIN.md / 指标"] --> H2["归因与假设"]
+        H2 --> H3["生成或修改技能"]
+        H3 --> H4["校验 + 影子运行"]
+        H4 --> H5["部署上线"]
+        H5 --> H1
+    end
+
+    S5 -.会话文档.-> H1
+    H5 -.技能包.-> S2
+```
+
+| 环 | 周期 | 负责 | 不允许做的事 |
+| --- | --- | --- | --- |
+| 快环 | 20~50 ms | 感知、决策、执行、记录 | 不做网络请求、不做文件压缩、不阻塞 |
+| 慢环 | 分钟级 | 归因、生成代码、验证、部署 | 不直接控制电机 |
+
+快环必须是确定性的：同样的遥测输入应产生同样的动作序列。因此技能里禁止网络调用、随机数（除显式种子）和长时间阻塞。
+
+### 9.7 状态机与权限
+
+```mermaid
+stateDiagram-v2
+    [*] --> BOOT
+    BOOT --> SELF_TEST
+    SELF_TEST --> IDLE
+    IDLE --> ARMED : ARM
+    ARMED --> IDLE : DISARM
+    ARMED --> RUN : 首个运动指令
+    RUN --> ARMED : 任务结束
+    ARMED --> FAULT : 故障 / 急停
+    RUN --> FAULT : 故障 / 急停
+    FAULT --> IDLE : CLEAR_FAULT
+    IDLE --> UPDATE : 收到技能包
+    UPDATE --> IDLE : 校验完成
+```
+
+| 状态 | 允许动作 | 进入条件 | 记录 |
+| --- | --- | --- | --- |
+| `BOOT` | 挂载、校验、恢复 | 上电 | `ev=boot` |
+| `SELF_TEST` | 传感器自检、能力核对 | 启动 | `ev=assert` |
+| `IDLE` | 读遥测、接收更新 | 自检通过 | `ev=state` |
+| `ARMED` | 接收运动指令 | 上位机 `ARM` + 物理使能 | `ev=state` |
+| `RUN` | 执行技能 | 首个运动指令 | `ev=state` |
+| `FAULT` | 只读、清故障 | 底盘故障 / 监督器触发 | `ev=state`、`CRIT` |
+| `UPDATE` | 写非活动槽、校验 | 仅从 `IDLE` 进入 | `ev=reload` |
+
+权限约定：
+
+- `ARM` 需要“物理使能 + 软件确认”双重条件，避免纯 AI 误触发；
+- 急停在任何状态都有效，且优先于所有软件逻辑；
+- 更新只能在 `IDLE` 且 `DISARM` 时应用；
+- `FAULT` 下禁止更新与运动，只能读取与清故障。
+
+### 9.8 与调试采集系统的复用
+
+这两套东西不是两个项目，而是同一个内核的两种用法：
+
+| 组件 | 调试采集系统 | 机器人运行时 | 复用方式 |
+| --- | --- | --- | --- |
+| `logcore/`（record / ring / writer / session） | 采集传感器与系统日志 | 记录决策链与执行结果 | 完全复用 |
+| 会话目录与文档规范 | `LOG.md` + `README.md` | 增加 `EXPLAIN.md` + `skill.json` | 同一套目录 |
+| `sinks/`（Flash / SD / U 盘 / 网络） | 落盘与导出 | 同左 | 完全复用 |
+| `updater.py`（A/B 槽位、回滚） | 更新应用 | 更新技能包，增加 `requires` 校验 | 同一实现 |
+| HTTP 服务 | `/tail` `/range` `/file` | 增加 `/state` `/why` `/update` | 同一服务多路由 |
+| `robot.json` | 设备与传感器自描述 | 由底盘 `CAPS` 动态生成能力表 | 同一份文件 |
+| `/CTL` 命令通道 | 采样率、日志级别 | 增加 `ARM` / `DISARM` / 技能参数 | 同一通道，白名单不同 |
+| 掉电恢复 | 截断最后一行 | 额外恢复 `bootcnt` 与状态快照 | 同一套扫描逻辑 |
+
+一句话概括三者的关系：
+
+- **调试采集系统** 提供 L0 事实；
+- **解释层** 在 L0 之上补 L1 决策与 L2 归因；
+- **技能层** 消费 L0/L1 的反馈，改写自己的行为。
+
+因此工程上只维护一个 `kernel/`，不要为机器人另写一套日志系统。
+
+### 9.9 统一工程目录
+
+```text
+robot/
+├── chassis-fw/              # 固定协议固件（C/C++，独立构建，极少变更）
+│   ├── protocol/
+│   ├── motor/
+│   └── safety/
+├── kernel/                  # MicroPython 运行时（本方案主体）
+│   ├── logcore/
+│   ├── sinks/
+│   ├── probes/
+│   ├── updater.py
+│   ├── supervisor.py
+│   └── chassis_client.py
+├── skills/                  # 技能包源码（AI 生成，按版本发布）
+│   ├── patrol/
+│   └── fetch/
+├── host/                    # 上位机工具
+│   ├── skillctl/            # 生成、校验、打包、部署、回滚
+│   ├── logctl/              # 取日志、/why 查询
+│   └── mcp/                 # 暴露给智能体的工具集
+└── docs/                    # 会话文档与协议文档
+```
+
+技能包不是直接改设备上的 `app_a/`，而是由 `skillctl` 打包成带哈希与 `requires` 的更新包，走第 8 章的更新流程写入非活动槽。这样“AI 改逻辑”与“设备上运行”之间始终有一道校验与回滚。
+
+### 9.10 技能粒度约定
+
+- **同一时刻只运行一个技能**，避免多个策略争抢底盘；
+- 通用动作（如 `drive_to`、`avoid`）放在 `kernel/behaviors/`，技能只做组合；
+- 需要多技能切换时，由一个上层 `policy` 技能按优先级调度，而不是让多个技能并发下发指令；
+- 每个技能必须声明 `max_runtime_s`，到期自动 `DISARM` 并写 `ev=close`。
+
+---
+
+## 10. 可靠性设计
+
+### 10.1 掉电恢复
 
 启动时执行一次扫描：
 
@@ -1060,14 +1367,14 @@ def recover(path):
 
 恢复结果写入新会话的 `boot` 记录，包含：上一个会话名、恢复到的 `seq`、丢弃字节数。
 
-### 9.2 时间同步
+### 10.2 时间同步
 
 - 每条记录必须写 `t`（单调时钟），`ts` 可为空；
 - 会话开始时由主机写入一次基准：`POST /ctl {"cmd":"set_time","epoch":...}`；
 - 有 RTC 时每次写记录读取 RTC 成本过高，改为每 60 s 用 RTC 校正一次 `epoch = rtc + ticks_diff(now, base_ticks)/1000`；
 - `ticks_ms()` 会回绕，所有差值必须用 `time.ticks_diff()`，禁止直接相减。
 
-### 9.3 背压与丢弃
+### 10.3 背压与丢弃
 
 | 策略 | 行为 | 适用 |
 | --- | --- | --- |
@@ -1077,14 +1384,14 @@ def recover(path):
 
 丢弃后必须写一条 `ev=drop` 汇总记录（含 `count` 与 `first_seq`），否则分析时无法解释缺口。
 
-### 9.4 介质降级
+### 10.4 介质降级
 
 - SD 卡写入失败：标记 Sink 不可用，切到 Flash，写 `degrade` 记录；
 - Flash 分区剩余 < 10%：删除 `_trash/` 中最旧会话；
 - 所有介质满：只保留 RAM 环形缓冲，并通过 BLE/MQTT 发 `CRIT`；
 - 网络断开：`NetSink` 进入重试队列，恢复后按 `seq` 续传，不重发已确认记录。
 
-### 9.5 存储介质注意事项
+### 10.5 存储介质注意事项
 
 | 介质 | 注意点 |
 | --- | --- |
@@ -1095,7 +1402,7 @@ def recover(path):
 
 ---
 
-## 10. 资源与性能预算
+## 11. 资源与性能预算
 
 以 ESP32-S3（约 300 KB 可用 heap）为例：
 
@@ -1113,9 +1420,9 @@ Flash 寿命估算：若每分钟 flush 一次、每次 4 KB，则每天写入�
 
 ---
 
-## 11. 部署与运行
+## 12. 部署与运行
 
-### 11.1 最小系统（P0）
+### 12.1 最小系统（P0）
 
 ```text
 开发板
@@ -1134,7 +1441,7 @@ Flash 寿命估算：若每分钟 flush 一次、每次 4 KB，则每天写入�
 6. 启动采样调度与 Writer 任务，心跳正常 5 s 后确认本次启动成功（清零 `bootcnt`）；
 7. 捕获 `KeyboardInterrupt` / 软复位，调用 `teardown()`、写 `close` 并生成 `LOG.md` 与 `EXPLAIN.md`。
 
-### 11.2 主机侧取数
+### 12.2 主机侧取数
 
 ```bash
 # 方式一：直接拷贝（SD / U 盘 / MSC）
@@ -1148,7 +1455,7 @@ curl -C - -o events.jsonl \
   "http://192.168.4.1/file?session=S20261016-142530&path=events.jsonl"
 ```
 
-### 11.3 智能体分析入口
+### 12.3 智能体分析入口
 
 ```bash
 # 先看摘要
@@ -1163,22 +1470,22 @@ jq 'select(.src=="bmp280" and .t>=60000 and .t<120000)' session/events.jsonl
 
 ---
 
-## 12. 实施计划
+## 13. 实施计划
 
-| 阶段 | 交付物 | 验收标准 |
-| --- | --- | --- |
-| P0 | 单传感器 + JSONL + LittleFS + manifest + 串口导出 | 拔电重启后能恢复到最后一条完整记录，`seq` 连续 |
-| P1 | Sink 抽象 + SD 卡 + 轮转淘汰 + 恢复报告 + LOG.md | 连续运行 24 h 无丢会话，目录可直接拷走分析 |
-| P2 | `robot.json` + 行为契约 + `intent/plan/action/outcome` + `/why` + EXPLAIN.md | 能回答“为什么停下”，并显式标注未埋点的缺口 |
-| P3 | WiFi HTTP API + index.jsonl + README.md + Range 下载 | 主机可按 `seq` 增量拉取，断网重连可续传 |
-| P4 | A/B 槽位 + `update.json` + 差分上传 + 安全点热重载 + 自动回滚 | 推一个新版本全程不编译；坏版本连续启动失败 3 次自动回退 |
-| P5 | BLE 告警 + `/CTL` 命令通道 + 高频二进制通道 + 版本对比 | 智能体能改参数或推版本，并按 `ev=reload` 对比新旧表现 |
+| 阶段 | 整机能力 | 日志 / 解释能力 | 验收标准 |
+| --- | --- | --- | --- |
+| P0 | 串口协议客户端，只读遥测（`HELLO` / `CAPS` / `TELEM`），不发运动指令 | JSONL + LittleFS + manifest + 断点恢复 | 能看到底盘遥测，拔电后恢复到最后一条完整记录 |
+| P1 | `ARM` / `DISARM` + `SET_VEL` + 限幅与 200 ms 超时验证 | Sink 抽象 + SD 卡 + 轮转 + `LOG.md` | 手动遥控可跑，断链自动停车，日志连续 |
+| P2 | 技能生命周期 `setup/step/on_event` + 参数 + 能力 ACL | `intent/plan/action/outcome` + `EXPLAIN.md` + `/why` | 单个巡逻技能可跑，能回答“为什么停下” |
+| P3 | shadow 模式 + 技能包校验 + A/B 槽位 + 自动回滚 | `ev=reload` 版本分段 + `/state` | 新技能先影子后上线，坏版本 3 次失败自动回退 |
+| P4 | `skillctl` + MCP 工具 + 指标回流 + 版本对比 | HTTP 拉取 + `index.jsonl` + 多会话 | AI 能读日志 → 改技能 → 再部署，闭环成立 |
+| P5 | policy 多技能调度 + BLE 告警 + 高频通道 | 高频二进制 + 版本差异量化 | 连续运行稳定，新旧版本差异可度量 |
 
-建议顺序：**P0 → P2 → P4**。先把记录格式与解释链路跑通，再做热更新——因为判断“新版本是不是变差了”依赖解释层提供的决策与结果记录。P3 的网络能力可以在 P2 之后并行推进。
+建议顺序：**先把 P0 / P1 的协议与安全边界打通**，这是不可回退的基础；再做 P2 / P3 的解释与更新；最后接 P4 的 AI 慢环。不要一上来就让 AI 生成动作逻辑——没有硬限幅、影子和反馈数据，生成的代码既无法验证也无法归因。
 
 ---
 
-## 13. 风险与取舍
+## 14. 风险与取舍
 
 | 风险 / 取舍 | 影响 | 应对 |
 | --- | --- | --- |
@@ -1196,12 +1503,17 @@ jq 'select(.src=="bmp280" and .t>=60000 and .t<120000)' session/events.jsonl
 | 更新过程掉电 | 应用目录损坏 | A/B 双槽 + 指针切换 + `bootcnt` 自动回退 |
 | 双槽位占用空间 | Flash 容量紧张 | 只保留两个应用槽；日志分区独立并做轮转 |
 | 应用持有旧对象引用 | 热重载后行为异常 | 强制 `teardown → setup` 重建，句柄统一由 `ctx` 提供 |
+| 底盘协议版本漂移 | 技能按错误语义执行 | `HELLO` 校验协议版本，`CAPS` 写入会话快照 |
+| AI 生成危险动作 | 设备或人身损伤 | 底盘硬限幅 + 急停 + shadow 模式 + 首次上线人工放行 |
+| 技能单步超时 | 控制周期抖动、指令堆积 | `deadline_ms` 预算 + 超时跳过下发 + `assert` 记录 |
+| 多技能争抢底盘 | 指令互相覆盖 | 同一时刻只运行一个技能，切换由 policy 统一调度 |
+| 影子模式误判 | 上线后行为与观察不一致 | 对比 intended 与 actual，差异超阈值禁止转 live |
 
 ---
 
-## 14. 附录
+## 15. 附录
 
-### 14.1 故障排查清单
+### 15.1 故障排查清单
 
 | 现象 | 可能原因 | 检查点 |
 | --- | --- | --- |
@@ -1212,7 +1524,7 @@ jq 'select(.src=="bmp280" and .t>=60000 and .t<120000)' session/events.jsonl
 | 记录重复 | 恢复后 `seq` 未续接 | 恢复逻辑是否读取了 `last_seq` |
 | 文件系统挂载失败 | 分区损坏 | 重新格式化分区，保留 `_trash` |
 
-### 14.2 最小记录样例（可直接用于单元测试）
+### 15.2 最小记录样例（可直接用于单元测试）
 
 ```json
 {"v":1,"seq":1,"t":0,"ts":null,"src":"sys","lvl":"INFO","ev":"boot","m":{"reset":"power_on"}}
@@ -1220,7 +1532,7 @@ jq 'select(.src=="bmp280" and .t>=60000 and .t<120000)' session/events.jsonl
 {"v":1,"seq":3,"t":2000,"ts":null,"src":"sys","lvl":"INFO","ev":"close","m":{"reason":"user"}}
 ```
 
-### 14.3 术语
+### 15.3 术语
 
 | 术语 | 含义 |
 | --- | --- |
