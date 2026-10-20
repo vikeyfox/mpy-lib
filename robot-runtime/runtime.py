@@ -4,9 +4,11 @@ from logcore import now_ms, sleep_ms
 
 
 class Runtime:
-    def __init__(self, link, journal, cfg=None):
+    def __init__(self, link, journal, cfg=None, skill=None, poller=None):
         self.link = link
         self.log = journal
+        self.skill = skill
+        self.poller = poller
         cfg = cfg or {}
         self.loop_ms = cfg.get("loop_ms", 20)
         self.log_hz = cfg.get("log_hz", 1)
@@ -27,6 +29,9 @@ class Runtime:
         self.handshake_logged = False
 
     def tick(self):
+        if self.poller is not None:
+            self.poller.poll()
+
         if self.state == "BOOT":
             self.link.hello()
             self.state = "HANDSHAKE"
@@ -56,6 +61,9 @@ class Runtime:
         elif not lost and self.link_lost:
             self.link_lost = False
             self.log.emit("sys", "INFO", "link", {"reason": "restored"})
+
+        if self.state != "FAULT" and self.skill is not None:
+            self.skill.tick(self.loop_ms)
 
         if self.state == "READY" and self.link.last_telem is not None:
             t = now_ms()

@@ -840,7 +840,8 @@ def invoke(behavior, args, why):
 
 ```json
 // current.json
-{"slot": "a", "version": "1.4.2", "prev": "b", "confirmed": true, "kernel_min": "1.0.0"}
+{"slot": "app_a", "prev": "app_b", "pending": true, "bootcnt": 0,
+ "version": "1.4.2", "entry": "main", "kernel_min": "1.0.0"}
 ```
 
 切换槽位只改 `current.json`，采用「写临时文件 → `os.rename` 覆盖」。日志目录与代码目录分离，更新不会触碰正在写入的会话。
@@ -850,26 +851,28 @@ def invoke(behavior, args, why):
 ```text
 pkg-1.4.2/
 ├── update.json
-└── app/
-    ├── main.py
-    ├── behaviors/
-    │   ├── go_to.py
-    │   └── grab.py
-    └── params.json
+├── main.py                 # 入口模块（槽位内相对路径）
+├── behaviors/
+│   ├── __init__.py         # 子包必须有，MicroPython 不支持隐式命名空间包
+│   ├── go_to.py
+│   └── grab.py
+└── params.json
 ```
 
 ```json
 {
   "version": "1.4.2",
   "kernel_min": "1.0.0",
-  "entry": "app.main",
+  "entry": "main",
   "note": "降低避障阈值，修复抓取超时",
   "files": [
-    {"path": "app/main.py", "size": 4213, "sha256": "9f2c..."},
-    {"path": "app/behaviors/go_to.py", "size": 2871, "sha256": "3ab1..."}
+    {"path": "main.py", "size": 4213, "sha256": "9f2c..."},
+    {"path": "behaviors/go_to.py", "size": 2871, "sha256": "3ab1..."}
   ]
 }
 ```
+
+包内路径全部相对槽位根目录；设备把 `app_a/` 或 `app_b/` 直接插入 `sys.path`，因此 `entry` 就是模块名。这样两个槽位可以用同名模块互不干扰，也避免 `app.app` 之类需要包的嵌套。
 
 上位机在打包时计算哈希；设备逐文件校验。上传前先对比 `/update/info` 返回的哈希表，只传变化的文件，实现差分更新。
 
@@ -894,7 +897,7 @@ sequenceDiagram
 | --- | --- | --- |
 | 查询 | `GET /update/info` | 返回当前槽位、版本、各文件哈希、`safe` 标志 |
 | 上传 | `PUT /update/file?slot=b&path=...` | 原始字节写入非活动槽，路径必须落在 `app_*` 内 |
-| 提交 | `POST /update/commit` | 校验全部哈希与语法，写 `pending.json` |
+| 提交 | `POST /update/commit` | 校验全部哈希与语法，切到非活动槽并写 `pending=true` |
 | 应用 | `POST /update/apply` | 立即尝试应用；失败则保持 pending，等下一个安全点 |
 | 状态 | `GET /update/status` | `idle / uploading / pending / applying / running / rolled_back` |
 | 回滚 | `POST /update/rollback` | 手动切回 `prev` |
@@ -1001,14 +1004,20 @@ def apply(pending, ctx):
 ### 8.8 上位机工具
 
 ```bash
+# 打包并在设备端查询后下发（当前实现，BLE 直连）
+pkgctl build ./skill --version 1.4.2
+pkgctl show  ./skill
+pkgctl push  ./skill --transport ble --name bot-c3-01
+
+# 通过 WiFi 时的 HTTP 形式（规划）
 logctl status --host 192.168.4.1
-logctl push ./pkg-1.4.2 --host 192.168.4.1   # 计算哈希 + 差分上传 + 提交
-logctl apply  --host 192.168.4.1             # 到安全点后应用
+logctl push ./pkg-1.4.2 --host 192.168.4.1
+logctl apply  --host 192.168.4.1
 logctl rollback --host 192.168.4.1
 logctl logs --tail 50 --host 192.168.4.1
 ```
 
-`logctl push` 不做任何编译，只做三件事：计算哈希、上传差异文件、调用 commit。主机侧可选的 `ast.parse` 仅用于提前发现明显语法错误，不生成字节码。
+`pkgctl push` 不做任何编译：主机侧只计算哈希、`ast.parse` 预检、分块下发，设备侧 `compile()` 才生成字节码。BLE 通道的完整帧定义见 8.16。
 
 ### 8.9 回滚与失败模式
 
@@ -1020,9 +1029,9 @@ logctl logs --tail 50 --host 192.168.4.1
 | 启动后崩溃 | 心跳缺失 / 看门狗 | 重启，`bootcnt++`，达到 3 次回滚 |
 | 新版本行为异常 | 主机看日志 | 手动 `logctl rollback`，保留现场会话 |
 | 内核不兼容 | `kernel_min` | 提交阶段拒绝 |
-| 更新中掉电 | 启动时检查 `pending.json` | 旧槽完整，`current.json` 未切换，直接走旧版本 |
+| 更新中掉电 | 启动时检查 `current.json` 的 `pending` | 旧槽完整，未确认则继续旧版本 |
 
-`bootcnt` 的写入必须在 `boot.py` 早期完成，且用独立的单行文件，避免依赖完整 JSON 解析。
+当前实现把 `bootcnt` 与槽位指针放在同一个 `current.json`：两者必须同时生效，且通过“临时文件 → `os.rename`”原子写入；文件损坏时 `boot_select()` 返回空，设备以纯采集模式启动并写 `ERROR`，不会带着坏指针进入应用。
 
 ### 8.10 边界与注意事项
 
@@ -1156,6 +1165,65 @@ OTA 全程写结构化记录，便于事后归因：
 ```
 
 应用镜像前必须同步 flush 一次，确保 `ev=ota` 落盘；重启后由新版本继续写同一会话，智能体据此按版本切分前后表现。
+
+### 8.16 已实现组件（P0 / P1）
+
+技能热更新链路已经落地为可运行的代码，与上文的槽位、校验、回滚设计一一对应：
+
+| 文件 | 职责 |
+| --- | --- |
+| `skills.py` | `SkillContext`（日志、遥测、`drive/stop`、参数、安全点判定）与 `SkillHost`（导入、`setup/step/teardown` 生命周期、快照恢复、健康确认、失败回滚） |
+| `updater.py` | 分块接收、sha256、逐文件 `compile()`、A/B 槽位、`current.json` 原子切换、`bootcnt` 回滚 |
+| `blelink.py` | 传输无关的 `UpdateServer` 与设备侧 `BleUpdatePeripheral`（NUS 风格 GATT，中断只收数据、主循环处理） |
+| `tools/pkgctl.py` | 上位机打包、`ast.parse` 预检、BLE 下发、文件回放 |
+| `examples/skill_demo/` | 最小技能示例：前进 → 停止 → 转向 → 停止循环，含 `params.json` 与快照 |
+
+#### BLE 帧格式
+
+```text
+AA 55 | type(1) | len(2, 小端) | payload | crc8(type + len 两字节 + payload)
+```
+
+| 命令 | 值 | 载荷 |
+| --- | --- | --- |
+| `INFO` | `0x10` | 空；返回槽位、版本、pending、bootcnt、内核版本 |
+| `BEGIN` | `0x20` | 完整 `update.json` |
+| `FILE` | `0x21` | `{"path": "main.py"}` |
+| `DATA` | `0x22` | 原始字节，长度 ≤ MTU-8 |
+| `END_FILE` | `0x23` | 空；触发大小、哈希与语法校验 |
+| `COMMIT` | `0x24` | 空；切换到非活动槽并写 `pending=true` |
+| `ABORT` | `0x25` | 空；丢弃暂存目录 |
+| `CONFIRM` | `0x26` | 空；健康运行后清除 pending |
+| `ROLLBACK` | `0x27` | 空；手动退回上一槽位 |
+| `REPLY` | `0x80` | `cmd + status + JSON`，按 20 字节通知分片 |
+
+GATT 使用 NUS UUID：服务 `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`，写入 `6E400002`，通知 `6E400003`。
+
+#### 下发与验证
+
+```bash
+# 打包（写 update.json，含每个文件的 size/sha256；语法错误直接拒绝）
+python3 tools/pkgctl.py build examples/skill_demo --version 1.0.1 --note "调整速度"
+
+# 查看包内容
+python3 tools/pkgctl.py show examples/skill_demo
+
+# 蓝牙下发（需要 pip install bleak）
+python3 tools/pkgctl.py push examples/skill_demo --transport ble --name bot-c3-01
+
+# 生成回放流，用于离线验证设备侧解析
+python3 tools/pkgctl.py push examples/skill_demo --transport replay --out update.stream
+```
+
+设备侧时序：
+
+1. `boot.py` 之后由 `SkillUpdater.boot_select()` 读取 `current.json`；`pending` 且 `bootcnt ≥ 3` 时自动回滚；
+2. `SkillHost.load()` 插入槽位路径、清理 `sys.modules`、导入 `entry`、执行 `setup(ctx)`；
+3. 提交后不立即重启：主循环检测到 `pending`，在 `ctx.safe_to_reload()` 为真时执行 `snapshot → teardown → 切换 → setup → restore`；
+4. 新版本连续健康运行 5 s 后 `confirm()` 清零 `bootcnt`；
+5. `setup` 抛异常立即回滚；`step` 连续 3 次抛异常同样回滚，并写 `CRIT`。
+
+当前约束：单文件 ≤ 32 KB、整包 ≤ 256 KB、入口模块须导出 `setup/step`、子包须带 `__init__.py`；BLE 与 WiFi 仍按第 9 章的链路模式分时使用；差分上传尚未实现，每次下发全量文件。
 
 ---
 

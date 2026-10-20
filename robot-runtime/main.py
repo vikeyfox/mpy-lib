@@ -1,12 +1,14 @@
-"""P0 入口：配置 -> 会话 -> 底盘链路 -> 运行时。"""
+"""P0 入口：配置 -> 会话 -> 底盘链路 -> 技能槽位 -> 运行时。"""
 
 import json
 import time
 
 from board import make_uart
 from chassis import ChassisLink, MockCodec
-from logcore import Session, now_ms
+from logcore import Session, ensure_dir, now_ms
 from runtime import Runtime
+from skills import SkillContext, SkillHost
+from updater import SkillUpdater
 
 
 def load_config(path="config.json"):
@@ -39,7 +41,40 @@ def main():
 
     rt_cfg = dict(cfg["runtime"])
     rt_cfg["device_id"] = cfg.get("device_id")
-    rt = Runtime(link, journal, rt_cfg)
+
+    updater = SkillUpdater("/")
+    ctx = SkillContext(journal, link, cfg)
+    ensure_dir("/STATE")
+    host = SkillHost(updater, ctx, state_dir="/STATE")
+
+    ble = None
+    ble_cfg = cfg.get("ble") or {}
+    if ble_cfg.get("enabled"):
+        try:
+            from blelink import BleUpdatePeripheral, UpdateServer
+
+            ble = BleUpdatePeripheral(
+                UpdateServer(updater),
+                ble_cfg.get("name", cfg.get("device_id", "bot-c3-01")),
+            )
+        except Exception as exc:
+            # 模式互斥或协议栈未就绪时降级为纯串口运行
+            journal.emit("sys", "WARN", "ble", {"err": str(exc)})
+
+    rt = Runtime(link, journal, rt_cfg, skill=host, poller=ble)
+
+    # 没有底盘遥测时视为静止，便于台架首次安装技能
+    ctx.safe_check = lambda: (
+        rt.state != "FAULT"
+        and not link.timed_out()
+        and (link.last_telem is None
+             or (link.last_telem.get("v") == 0 and link.last_telem.get("w") == 0))
+    )
+
+    try:
+        host.load()
+    except Exception:
+        journal.emit("app", "ERROR", "reload", {"stage": "boot"})
 
     try:
         rt.run()

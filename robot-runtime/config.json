@@ -7,6 +7,10 @@
     "rx": 7
   },
   "led": 5,
+  "ble": {
+    "enabled": true,
+    "name": "bot-c3-01"
+  },
   "log": {
     "root": "/LOG",
     "flush_ms": 1000,

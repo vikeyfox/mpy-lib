@@ -14,6 +14,7 @@ MSG_HELLO = 0x01
 MSG_CAPS = 0x02
 MSG_TELEM = 0x03
 MSG_FAULT = 0x04
+MSG_VEL = 0x05
 
 
 def _now_ms():
@@ -36,6 +37,11 @@ def crc8(data):
 
 def _s16(value):
     return value - 0x10000 if value & 0x8000 else value
+
+
+def _pack_s16(value):
+    value = int(value) & 0xFFFF
+    return bytes([value & 0xFF, (value >> 8) & 0xFF])
 
 
 class FrameCodec:
@@ -137,6 +143,16 @@ class ChassisLink:
                 self.state = "FAULT"
                 events.append(("fault", payload))
         return events
+
+    def drive(self, v, w):
+        """下发速度指令。Mock 协议帧，接入真实底盘时替换为对应字段。"""
+        if self.state != "READY":
+            return False
+        self.uart.write(self.codec.encode(MSG_VEL, _pack_s16(v) + _pack_s16(w)))
+        return True
+
+    def stop(self):
+        return self.drive(0, 0)
 
     def timed_out(self):
         if self.last_rx is None:
