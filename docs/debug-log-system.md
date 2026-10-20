@@ -1186,10 +1186,10 @@ AA 55 | type(1) | len(2, 小端) | payload | crc8(type + len 两字节 + payload
 
 | 命令 | 值 | 载荷 |
 | --- | --- | --- |
-| `INFO` | `0x10` | 空；返回槽位、版本、pending、bootcnt、内核版本 |
+| `INFO` | `0x10` | 空；返回槽位、版本、pending、bootcnt、内核版本，以及技能运行状态 `app`（failures / healthy_ms / error） |
 | `BEGIN` | `0x20` | 完整 `update.json` |
 | `FILE` | `0x21` | `{"path": "main.py"}` |
-| `DATA` | `0x22` | 原始字节，长度 ≤ MTU-8 |
+| `DATA` | `0x22` | 原始字节，长度 ≤ MTU-9（扣除 ATT 与 6 字节帧头） |
 | `END_FILE` | `0x23` | 空；触发大小、哈希与语法校验 |
 | `COMMIT` | `0x24` | 空；切换到非活动槽并写 `pending=true` |
 | `ABORT` | `0x25` | 空；丢弃暂存目录 |
@@ -1202,18 +1202,25 @@ GATT 使用 NUS UUID：服务 `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`，写入 `6
 #### 下发与验证
 
 ```bash
-# 打包（写 update.json，含每个文件的 size/sha256；语法错误直接拒绝）
+# 打包（写 update.json，含每个文件的 size/sha256；语法或入口错误直接拒绝）
 python3 tools/pkgctl.py build examples/skill_demo --version 1.0.1 --note "调整速度"
 
 # 查看包内容
 python3 tools/pkgctl.py show examples/skill_demo
 
-# 蓝牙下发（需要 pip install bleak）
-python3 tools/pkgctl.py push examples/skill_demo --transport ble --name bot-c3-01
+# 查询设备当前槽位、版本、pending 与技能健康状况
+python3 tools/pkgctl.py status --name bot-c3-01
+python3 tools/pkgctl.py status --name bot-c3-01 --json
 
-# 生成回放流，用于离线验证设备侧解析
+# 安装：下发后持续轮询 INFO，直到切换完成并健康确认；失败或超时返回非零
+python3 tools/pkgctl.py install examples/skill_demo --version 1.0.1 --name bot-c3-01
+python3 tools/pkgctl.py install examples/skill_demo --version 1.0.1 --no-wait
+
+# 仅生成回放流，用于离线验证设备侧解析
 python3 tools/pkgctl.py push examples/skill_demo --transport replay --out update.stream
 ```
+
+`install` 必须提供 `--version`，因为确认阶段要靠版本号判断“切到了新版本”还是“已回滚到旧版本”。判定逻辑：`pending=false` 且 `version` 与目标一致且 `app.error` 为空才算成功；超时（默认 60 s）或检测到回滚时以非零码退出。
 
 设备侧时序：
 

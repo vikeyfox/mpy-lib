@@ -54,7 +54,7 @@ def main():
             from blelink import BleUpdatePeripheral, UpdateServer
 
             ble = BleUpdatePeripheral(
-                UpdateServer(updater),
+                UpdateServer(updater, status_provider=host.status),
                 ble_cfg.get("name", cfg.get("device_id", "bot-c3-01")),
             )
         except Exception as exc:

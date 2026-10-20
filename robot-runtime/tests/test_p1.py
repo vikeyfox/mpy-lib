@@ -154,6 +154,22 @@ class UpdaterTests(unittest.TestCase):
             updater.begin({"files": [{"path": "../evil.py", "size": 1,
                                       "sha256": "0" * 64}]})
 
+    def test_entry_missing_rejected(self):
+        updater = SkillUpdater(self.base)
+        with self.assertRaises(UpdateError):
+            updater.begin({
+                "entry": "missing",
+                "files": [{"path": "main.py", "size": 1, "sha256": "0" * 64}],
+            })
+
+    def test_build_rejects_missing_entry(self):
+        src = os.path.join(self.base, "src")
+        os.makedirs(src, exist_ok=True)
+        with open(os.path.join(src, "main.py"), "w") as f:
+            f.write("def setup(ctx):\n    pass\n")
+        with self.assertRaises(SystemExit):
+            pkgctl.build(src, "1.0.0", "missing", "", "0.1.0", None)
+
 
 class SkillHostTests(unittest.TestCase):
     def setUp(self):
@@ -264,6 +280,30 @@ def step(dt_ms):
         replies = server.feed(pkgctl.encode_frame(CMD_INFO))
         self.assertIn(b'"ok": true', replies[0])
         self.assertIn(b'"kernel"', replies[0])
+
+    def test_ble_info_includes_app_status(self):
+        updater = SkillUpdater(self.base)
+        server = UpdateServer(
+            updater,
+            status_provider=lambda: {"slot": "app_a", "failures": 0, "error": None},
+        )
+        frame = server.feed(pkgctl.encode_frame(CMD_INFO))[0]
+        length = frame[3] | (frame[4] << 8)
+        info = json.loads(frame[7:5 + length])
+        self.assertEqual(info["app"]["slot"], "app_a")
+
+
+class InstallCheckTests(unittest.TestCase):
+    def test_states(self):
+        self.assertTrue(pkgctl.check_installed(
+            {"version": "1.0.0", "pending": False, "app": {}}, "1.0.0")[0])
+        self.assertFalse(pkgctl.check_installed(
+            {"version": "0.9.0", "pending": False, "app": {}}, "1.0.0")[0])
+        self.assertFalse(pkgctl.check_installed(
+            {"version": "1.0.0", "pending": True, "app": {}}, "1.0.0")[0])
+        self.assertFalse(pkgctl.check_installed(
+            {"version": "1.0.0", "pending": False,
+             "app": {"error": "boom"}}, "1.0.0")[0])
 
 
 if __name__ == "__main__":

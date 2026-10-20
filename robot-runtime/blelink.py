@@ -102,9 +102,10 @@ def _kernel_ok(required, current):
 class UpdateServer:
     """把 BLE 帧翻译为 SkillUpdater 调用，不关心底层是 BLE 还是串口。"""
 
-    def __init__(self, updater, kernel_version="0.1.0"):
+    def __init__(self, updater, kernel_version="0.1.0", status_provider=None):
         self.updater = updater
         self.kernel_version = kernel_version
+        self.status_provider = status_provider
         self.decoder = FrameDecoder()
 
     def feed(self, data):
@@ -154,7 +155,7 @@ class UpdateServer:
 
     def _info(self):
         doc = self.updater.current() or {}
-        return {
+        info = {
             "slot": doc.get("slot"),
             "version": doc.get("version"),
             "id": doc.get("id"),
@@ -163,6 +164,12 @@ class UpdateServer:
             "bootcnt": doc.get("bootcnt", 0),
             "kernel": self.kernel_version,
         }
+        if self.status_provider is not None:
+            try:
+                info["app"] = self.status_provider()
+            except Exception as exc:
+                info["app"] = {"error": str(exc)}
+        return info
 
 
 def _uuid_bytes(text):

@@ -1,10 +1,11 @@
-"""上位机技能包工具：打包、查看、下发（BLE 或文件回放）。
+"""上位机技能包工具：打包、查看、状态查询、BLE 安装、文件回放。
 
 用法：
-    python3 tools/pkgctl.py build ./skill --version 1.0.1 --note "降低避障阈值"
-    python3 tools/pkgctl.py show  ./skill
-    python3 tools/pkgctl.py push  ./skill --transport ble --name bot-c3-01
-    python3 tools/pkgctl.py push  ./skill --transport replay --out update.stream
+    python3 tools/pkgctl.py build   ./skill --version 1.0.1 --note "降低避障阈值"
+    python3 tools/pkgctl.py show    ./skill
+    python3 tools/pkgctl.py status  --name bot-c3-01
+    python3 tools/pkgctl.py install ./skill --name bot-c3-01
+    python3 tools/pkgctl.py push    ./skill --transport replay --out update.stream
 
 包内不生成字节码，设备侧 import 时由 MicroPython 编译。
 """
@@ -16,6 +17,8 @@ import hashlib
 import json
 import os
 import sys
+import time
+from contextlib import asynccontextmanager
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -23,7 +26,7 @@ if ROOT not in sys.path:
 
 from blelink import (  # noqa: E402
     CMD_BEGIN, CMD_COMMIT, CMD_DATA, CMD_END_FILE, CMD_FILE, CMD_INFO,
-    FrameDecoder, encode_frame,
+    UUID_RX, UUID_TX, FrameDecoder, encode_frame,
 )
 
 MAX_FILE = 32 * 1024
@@ -69,6 +72,14 @@ def build(src, version, entry, note, kernel_min, pkg_id):
         raise SystemExit("目录为空: %s" % src)
     if total > MAX_PKG:
         raise SystemExit("整包过大: %d > %d" % (total, MAX_PKG))
+
+    entry = str(entry or "main").strip()
+    if entry.startswith("/") or ".." in entry.split(".") or "/" in entry:
+        raise SystemExit("非法入口: %s" % entry)
+    paths = {item["path"] for item in files}
+    epath = entry.replace(".", "/")
+    if epath + ".py" not in paths and epath + "/__init__.py" not in paths:
+        raise SystemExit("入口不在包内: %s" % entry)
 
     manifest = {
         "id": pkg_id or os.path.basename(os.path.abspath(src)),
@@ -195,7 +206,33 @@ def _check(reply):
         raise SystemExit("设备拒绝: %s" % reply.get("err", "unknown"))
 
 
-async def push_ble(manifest, src, name, address, chunk, timeout):
+def check_installed(info, version):
+    """判断设备是否真正切到目标版本并完成确认。"""
+    if info.get("pending"):
+        return False, "设备已接收，等待安全点切换"
+    if info.get("version") != version:
+        return False, "当前版本 %s，未切到 %s（可能已回滚）" % (
+            info.get("version"), version)
+    app = info.get("app") or {}
+    if app.get("error"):
+        return False, "技能异常: %s" % app["error"]
+    return True, "已确认版本 %s" % version
+
+
+def format_info(info):
+    lines = ["slot=%s version=%s pending=%s bootcnt=%s kernel=%s" % (
+        info.get("slot"), info.get("version"), info.get("pending"),
+        info.get("bootcnt"), info.get("kernel"))]
+    app = info.get("app") or {}
+    if app:
+        lines.append("app: slot=%s version=%s failures=%s healthy_ms=%s error=%s" % (
+            app.get("slot"), app.get("version"), app.get("failures"),
+            app.get("healthy_ms"), app.get("error")))
+    return "\n".join(lines)
+
+
+@asynccontextmanager
+async def ble_channel(name, address, timeout):
     try:
         from bleak import BleakClient, BleakScanner
     except ImportError:
@@ -208,22 +245,31 @@ async def push_ble(manifest, src, name, address, chunk, timeout):
             raise SystemExit("未发现设备: %s" % name)
         address = hit.address
 
-    from blelink import UUID_RX, UUID_TX
-
     async with BleakClient(address, timeout=timeout) as client:
         channel = BleChannel(client, UUID_RX, UUID_TX)
         await client.start_notify(UUID_TX, channel.on_notify)
+        yield client, channel
 
-        info = await channel.send(encode_frame(CMD_INFO), expect=CMD_INFO, timeout=timeout)
-        _check(info)
-        print("device: slot=%s version=%s pending=%s" % (
-            info.get("slot"), info.get("version"), info.get("pending")))
+
+async def read_info(channel, timeout):
+    info = await channel.send(encode_frame(CMD_INFO), expect=CMD_INFO, timeout=timeout)
+    _check(info)
+    return info
+
+
+async def push_ble(manifest, src, name, address, chunk, timeout, confirm_timeout=0):
+    total = sum(item["size"] for item in manifest["files"])
+    started = time.monotonic()
+
+    async with ble_channel(name, address, timeout) as (client, channel):
+        info = await read_info(channel, timeout)
+        print("device: %s" % format_info(info))
 
         reply = await channel.send(
             encode_frame(CMD_BEGIN, json.dumps(manifest).encode()),
             expect=CMD_BEGIN, timeout=timeout)
         _check(reply)
-        print("begin: %d files" % reply.get("files", 0))
+        print("begin: %d files, %d bytes" % (reply.get("files", 0), total))
 
         mtu = int(getattr(client, "mtu_size", 23) or 23)
         size = max(8, min(chunk, mtu - 9))  # 扣除 ATT 与 6 字节帧头
@@ -249,9 +295,35 @@ async def push_ble(manifest, src, name, address, chunk, timeout):
         reply = await channel.send(
             encode_frame(CMD_COMMIT), expect=CMD_COMMIT, timeout=timeout)
         _check(reply)
-        print("commit: slot=%s pending=%s bytes=%d" % (
-            reply.get("slot"), reply.get("pending"), sent))
-        print("设备会在安全点切换；保持上电，健康运行 5 s 后自动确认。")
+        print("commit: slot=%s %d/%d bytes, %.1fs" % (
+            reply.get("slot"), sent, total, time.monotonic() - started))
+
+        if not confirm_timeout:
+            print("设备会在安全点切换；保持上电，健康运行 5 s 后自动确认。")
+            return 0
+
+        print("等待设备确认（安全点切换 + 5 s 健康运行）...")
+        deadline = asyncio.get_running_loop().time() + confirm_timeout
+        while True:
+            info = await read_info(channel, timeout)
+            ok, msg = check_installed(info, manifest["version"])
+            if ok:
+                print(msg)
+                return 0
+            if info.get("version") != manifest["version"] and not info.get("pending"):
+                raise SystemExit("安装失败: " + msg)
+            if asyncio.get_running_loop().time() >= deadline:
+                raise SystemExit("等待确认超时: " + msg)
+            await asyncio.sleep(1)
+
+
+async def status_ble(name, address, timeout, as_json):
+    async with ble_channel(name, address, timeout) as (_client, channel):
+        info = await read_info(channel, timeout)
+        if as_json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+        else:
+            print(format_info(info))
     return 0
 
 
@@ -271,11 +343,36 @@ def cmd_push(args):
         manifest, args.src, args.name, args.address, args.chunk, args.timeout))
 
 
+def cmd_install(args):
+    old = load_manifest(args.src) or {}
+    version = args.version or old.get("version")
+    if not version:
+        raise SystemExit("安装需要 --version，例如 --version 1.0.1")
+    manifest = build(
+        args.src,
+        version,
+        args.entry or old.get("entry") or "main",
+        args.note if args.note is not None else old.get("note", ""),
+        args.kernel_min or old.get("kernel_min") or "0.1.0",
+        args.id or old.get("id"),
+    )
+    if args.transport == "replay":
+        return push_replay(manifest, args.src, args.out, args.chunk)
+    wait = 0 if args.no_wait else args.confirm_timeout
+    return asyncio.run(push_ble(
+        manifest, args.src, args.name, args.address, args.chunk,
+        args.timeout, confirm_timeout=wait))
+
+
+def cmd_status(args):
+    return asyncio.run(status_ble(args.name, args.address, args.timeout, args.json))
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    def common(p):
+    def pkg_args(p):
         p.add_argument("src")
         p.add_argument("--version")
         p.add_argument("--entry")
@@ -283,8 +380,14 @@ def main():
         p.add_argument("--kernel-min")
         p.add_argument("--id")
 
+    def ble_args(p):
+        p.add_argument("--name", default="bot-c3-01")
+        p.add_argument("--address")
+        p.add_argument("--chunk", type=int, default=180)
+        p.add_argument("--timeout", type=int, default=20)
+
     p = sub.add_parser("build")
-    common(p)
+    pkg_args(p)
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("show")
@@ -292,14 +395,27 @@ def main():
     p.set_defaults(func=cmd_show)
 
     p = sub.add_parser("push")
-    common(p)
+    pkg_args(p)
     p.add_argument("--transport", choices=("ble", "replay"), default="ble")
+    p.add_argument("--out", default="update.stream")
+    ble_args(p)
+    p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser("install")
+    pkg_args(p)
+    p.add_argument("--transport", choices=("ble", "replay"), default="ble")
+    p.add_argument("--out", default="update.stream")
+    p.add_argument("--no-wait", action="store_true", help="下发后不等待确认")
+    p.add_argument("--confirm-timeout", type=int, default=60)
+    ble_args(p)
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("status")
     p.add_argument("--name", default="bot-c3-01")
     p.add_argument("--address")
-    p.add_argument("--out", default="update.stream")
-    p.add_argument("--chunk", type=int, default=180)
     p.add_argument("--timeout", type=int, default=20)
-    p.set_defaults(func=cmd_push)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
     raise SystemExit(args.func(args))
